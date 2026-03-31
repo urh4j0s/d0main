@@ -1,0 +1,185 @@
+"""
+check_hu_3char_domains.py
+=========================
+Checks availability of ALL 3-character .hu domains (a-z, 0-9)
+via the official Hungarian WHOIS server (whois.nic.hu).
+
+Usage:
+    python check_hu_3char_domains.py
+
+Output:
+    - Prints available domains to the console
+    - Saves results to: available_hu_3char.txt
+    - Saves a log of all results to: hu_3char_results.csv
+
+Requirements:
+    pip install tqdm   (optional, for progress bar)
+
+Notes:
+    - Total combinations: 36^3 = 46,656 domains
+    - Uses a thread pool for speed (default: 20 workers)
+    - Rate-limited to ~10 req/sec to avoid IP bans
+    - Estimated runtime: ~90 minutes
+    - If you get blocked/throttled, lower MAX_WORKERS and RATE_LIMIT
+"""
+
+import socket
+import time
+import itertools
+import string
+import csv
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Semaphore
+from datetime import datetime
+
+# ── Configuration ──────────────────────────────────────────────
+WHOIS_HOST    = "whois.nic.hu"
+WHOIS_PORT    = 43
+TIMEOUT       = 10          # seconds per connection
+MAX_WORKERS   = 20          # concurrent threads
+RATE_LIMIT    = 10          # max requests per second
+OUTPUT_FILE   = "available_hu_3char.txt"
+LOG_FILE      = "hu_3char_results.csv"
+# ───────────────────────────────────────────────────────────────
+
+# Characters allowed in .hu domain names (ASCII)
+CHARS = string.ascii_lowercase + string.digits  # a-z + 0-9
+
+# Rate limiter (token bucket via semaphore)
+rate_semaphore = Semaphore(RATE_LIMIT)
+
+def release_token():
+    """Release a rate-limit token after 1 second."""
+    time.sleep(1.0 / RATE_LIMIT)
+    rate_semaphore.release()
+
+def whois_query(domain: str) -> str:
+    """Send a WHOIS query and return the raw response."""
+    try:
+        with socket.create_connection((WHOIS_HOST, WHOIS_PORT), timeout=TIMEOUT) as sock:
+            sock.sendall((domain + "\r\n").encode())
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        return response.decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"ERROR: {e}"
+
+def is_available(whois_response: str) -> bool:
+    """
+    Parse the WHOIS response to determine if the domain is available.
+    The Hungarian registry returns 'no match' for unregistered domains.
+    """
+    lower = whois_response.lower()
+    # Available indicators
+    if "no match" in lower:
+        return True
+    if "not found" in lower:
+        return True
+    if "status: available" in lower:
+        return True
+    # Registered indicators
+    if "domain:" in lower:
+        return False
+    if "registrar:" in lower:
+        return False
+    if "error" in lower:
+        return None  # Unknown / query error
+    return None  # Unknown
+
+def check_domain(name: str) -> tuple[str, bool | None, str]:
+    """Check a single domain and return (domain, available, raw_response)."""
+    domain = f"{name}.hu"
+    rate_semaphore.acquire()
+
+    import threading
+    threading.Timer(1.0, rate_semaphore.release).start()
+
+    response = whois_query(domain)
+    available = is_available(response)
+    return domain, available, response
+
+def generate_3char_combinations():
+    """Generate all valid 3-character .hu label names."""
+    for combo in itertools.product(CHARS, repeat=3):
+        yield "".join(combo)
+
+def main():
+    all_names = list(generate_3char_combinations())
+    total = len(all_names)
+    print(f"[{datetime.now():%H:%M:%S}] Checking {total:,} 3-character .hu domains...")
+    print(f"  WHOIS server : {WHOIS_HOST}:{WHOIS_PORT}")
+    print(f"  Workers      : {MAX_WORKERS}")
+    print(f"  Rate limit   : {RATE_LIMIT} req/sec")
+    print(f"  Est. runtime : ~{total / RATE_LIMIT / 60:.0f} minutes\n")
+
+    available = []
+    errors    = []
+    done      = 0
+
+    # Try importing tqdm for a progress bar
+    try:
+        from tqdm import tqdm
+        progress = tqdm(total=total, unit="domain", dynamic_ncols=True)
+    except ImportError:
+        progress = None
+
+    with open(LOG_FILE, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["domain", "status", "timestamp"])
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(check_domain, name): name for name in all_names}
+
+            for future in as_completed(futures):
+                domain, avail, response = future.result()
+                done += 1
+
+                if avail is True:
+                    status = "available"
+                    available.append(domain)
+                    print(f"  ✅  {domain}")
+                elif avail is False:
+                    status = "registered"
+                elif avail is None and response.startswith("ERROR"):
+                    status = "error"
+                    errors.append(domain)
+                else:
+                    status = "unknown"
+
+                writer.writerow([domain, status, datetime.now().isoformat()])
+
+                if progress:
+                    progress.update(1)
+                    progress.set_postfix(available=len(available), errors=len(errors))
+                elif done % 500 == 0:
+                    pct = done / total * 100
+                    print(f"  [{pct:5.1f}%] {done}/{total} checked — {len(available)} available so far")
+
+    if progress:
+        progress.close()
+
+    # Save available domains
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        for d in sorted(available):
+            f.write(d + "\n")
+
+    print(f"\n{'='*50}")
+    print(f"Done! {done:,} domains checked.")
+    print(f"  Available : {len(available):,}")
+    print(f"  Errors    : {len(errors):,}")
+    print(f"\nResults saved to:")
+    print(f"  {OUTPUT_FILE}  — available domains only")
+    print(f"  {LOG_FILE}     — full log (CSV)")
+
+    if available:
+        print(f"\nAvailable 3-character .hu domains ({len(available)}):")
+        for d in sorted(available):
+            print(f"  {d}")
+
+if __name__ == "__main__":
+    main()
